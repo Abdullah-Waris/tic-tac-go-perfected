@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any
+from dataclasses import asdict
+from hashlib import sha256
+from pathlib import Path
+from typing import Any, Callable
 
 from solver.board_utils import board_dimensions, normalize_board, to_wire_board
 from solver import optimized_solver
@@ -29,6 +32,8 @@ from solver.legacy_solver import (
 DAILY_PUSH_MAX_NODES = 500_000
 DAILY_PUSH_TIMEOUT_SECONDS = 30.0
 DAILY_PUSH_QUALITY_TIMEOUT_SECONDS = 10.0
+CUSTOM_PUSH_MAX_NODES = 100_000
+CUSTOM_PUSH_TIMEOUT_SECONDS = 5.0
 
 
 def _solver_impl(board: tuple[tuple[str, ...], ...] | None = None) -> str:
@@ -170,7 +175,29 @@ def _run_heuristic_cnn_solver(
     return heuristic_cnn_solver.solve(board)
 
 
-def solve_daily_board(board: list[list[str]]) -> dict[str, Any]:
+def daily_push_version() -> str:
+    version = os.getenv("DAILY_PUSH_SOLVER_VERSION", "v3").strip().lower()
+    if version not in {"v3", "v4"}:
+        raise SolverError("DAILY_PUSH_SOLVER_VERSION must be v3 or v4.")
+    return version
+
+
+def daily_push_settings(version: str) -> dict[str, Any]:
+    settings = {
+        "max_nodes": DAILY_PUSH_MAX_NODES,
+        "timeout_seconds": DAILY_PUSH_TIMEOUT_SECONDS,
+        "quality_timeout_seconds": DAILY_PUSH_QUALITY_TIMEOUT_SECONDS,
+    }
+    if version == "v4":
+        settings.update(schedule="coverage", route_limit=2, quality_timeout_seconds=DAILY_PUSH_TIMEOUT_SECONDS)
+    return settings
+
+
+def solve_daily_board(
+    board: list[list[str]],
+    *,
+    on_push_complete: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """Run the production daily portfolio: push first, then Beam/CNN fallback."""
     try:
         start_board = normalize_board(board)
@@ -178,22 +205,73 @@ def solve_daily_board(board: list[list[str]]) -> dict[str, Any]:
         raise SolverError(str(exc)) from exc
 
     start_time = time.perf_counter()
-    push_result = _run_push_solver(
+    version = daily_push_version()
+    if version == "v4":
+        from solver.push_solver import solve_v4
+
+        runner = solve_v4
+    else:
+        runner = _run_push_solver
+    push_started = time.perf_counter()
+    push_result = runner(
         start_board,
-        max_nodes=DAILY_PUSH_MAX_NODES,
-        timeout_seconds=DAILY_PUSH_TIMEOUT_SECONDS,
-        quality_timeout_seconds=DAILY_PUSH_QUALITY_TIMEOUT_SECONDS,
+        **daily_push_settings(version),
     )
     moves = push_result.moves
     final_board = push_result.final_board
     states_checked = push_result.nodes_expanded
-    solver_name = "push-v3"
+    solver_name = f"push-{version}"
+    diagnostics = {
+        "push_version": version,
+        "push_expanded_nodes": push_result.nodes_expanded,
+        "push_wall_ms": (time.perf_counter() - push_started) * 1000,
+        "push_attempts": [
+            asdict(attempt) for attempt in getattr(push_result, "attempts", ())
+        ],
+        "push_diagnostics": getattr(push_result, "diagnostics", None),
+        "fallback_reported_transitions": 0,
+        "push_quality_expanded_nodes": getattr(
+            push_result, "quality_nodes_expanded", 0
+        ),
+        "limits": {
+            "push_seconds": DAILY_PUSH_TIMEOUT_SECONDS,
+            "push_nodes": DAILY_PUSH_MAX_NODES,
+        },
+    }
+    from solver.push_solver.benchmark_v4 import provenance
+
+    environment = provenance()
+    diagnostics["runtime"] = environment["runtime"]
+    diagnostics["source_hashes"] = environment["sources"]
+    diagnostics["model_hashes"] = environment["models"] if version == "v3" else {}
+    diagnostics["phase"] = "fallback_running" if moves is None else "push_complete"
+    if on_push_complete is not None:
+        on_push_complete(diagnostics)
 
     if moves is None:
-        fallback_moves, _fallback_board, fallback_states = _run_heuristic_cnn_solver(
-            start_board
+        model_path = Path(__file__).with_name("small_cnn_policy.npz")
+        diagnostics["fallback_model_sha256"] = (
+            sha256(model_path.read_bytes()).hexdigest() if model_path.exists() else None
         )
+        fallback_started = time.perf_counter()
+        try:
+            fallback_moves, _fallback_board, fallback_states = (
+                _run_heuristic_cnn_solver(start_board)
+            )
+        except Exception as exc:
+            diagnostics["phase"] = "fallback_failed"
+            diagnostics["fallback_wall_ms"] = (
+                time.perf_counter() - fallback_started
+            ) * 1000
+            diagnostics["fallback_error"] = str(exc)
+            exc.diagnostics = diagnostics
+            raise
         states_checked += fallback_states
+        diagnostics["fallback_reported_transitions"] = fallback_states
+        diagnostics["fallback_wall_ms"] = (
+            time.perf_counter() - fallback_started
+        ) * 1000
+        diagnostics["fallback_solved"] = fallback_moves is not None
         solver_name = "heuristic-CNN"
 
         if fallback_moves is not None:
@@ -201,14 +279,16 @@ def solve_daily_board(board: list[list[str]]) -> dict[str, Any]:
 
             verification = verify_solution(start_board, fallback_moves)
             if not verification.ok:
-                raise RuntimeError(
+                error = RuntimeError(
                     "Heuristic-CNN fallback returned an invalid solution: "
                     f"{verification.error}"
                 )
+                error.diagnostics = diagnostics
+                raise error
             moves = fallback_moves
             final_board = verification.final_board
 
-    return _build_result(
+    result = _build_result(
         start_board,
         moves=moves,
         final_board=final_board,
@@ -216,9 +296,60 @@ def solve_daily_board(board: list[list[str]]) -> dict[str, Any]:
         solver_name=solver_name,
         start_time=start_time,
     )
+    result["diagnostics"] = diagnostics
+    diagnostics["phase"] = "complete"
+    return result
 
 
-def solve_board(board: list[list[str]], max_states: int | None = None) -> dict[str, Any]:
+def solve_custom_board(board: list[list[str]]) -> dict[str, Any]:
+    """Solve an editor-submitted board with a fixed public resource budget.
+
+    Custom solves intentionally do not fall back to the long-running CNN/beam
+    portfolio used for the daily job. Every successful response is replayed by
+    the existing verifier before it can be cached or shown to a visitor.
+    """
+    if not 3 <= len(board) <= 8 or any(not 3 <= len(row) <= 8 for row in board):
+        raise SolverError("Custom boards must be between 3x3 and 8x8.")
+    widths = {len(row) for row in board}
+    if len(widths) != 1:
+        raise SolverError("Custom boards must be rectangular.")
+    try:
+        start_board = normalize_board(board)
+    except ValueError as exc:
+        raise SolverError(str(exc)) from exc
+
+    start_time = time.perf_counter()
+    result = _run_push_solver(
+        start_board,
+        max_nodes=CUSTOM_PUSH_MAX_NODES,
+        timeout_seconds=CUSTOM_PUSH_TIMEOUT_SECONDS,
+        quality_timeout_seconds=0.0,
+    )
+    moves = result.moves
+    final_board = result.final_board
+    if moves is not None:
+        from solver.push_solver import verify_solution
+
+        verification = verify_solution(start_board, moves)
+        if not verification.ok:
+            raise RuntimeError(
+                f"Custom push solver returned an invalid solution: {verification.error}"
+            )
+        final_board = verification.final_board
+
+    return _build_result(
+        start_board,
+        moves=moves,
+        final_board=final_board,
+        states_checked=result.nodes_expanded,
+        solver_name="push-v3-custom",
+        start_time=start_time,
+    )
+
+
+def solve_board(
+    board: list[list[str]], max_states: int | None = None
+) -> dict[str, Any]:
     """Solve a Tic Tac Go board and return a normalized result dict.
 
     Routing logic:

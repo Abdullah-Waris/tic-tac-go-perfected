@@ -1,7 +1,10 @@
-import Link from "next/link";
 import { SolveDashboard, type DailyStatus } from "./solve-dashboard";
 import type { Cell } from "./replay-model";
 import { formatLongDate } from "./solution-data";
+import { HistoryCarousel } from "./history-carousel";
+import { buildSolutionExplanation } from "./solution-explanation";
+import { SolutionHints } from "./solution-hints";
+import { GardenLink } from "./garden-shell";
 
 type SolveStep = {
   move: string;
@@ -37,20 +40,15 @@ type Props = {
   history: HistoryEntry[];
   isDemo: boolean;
   isTodayPage: boolean;
+  loadSharedHistory?: boolean;
+  optimized?: { moveCount: number; optimalityProven: boolean };
+  isOptimizedPage?: boolean;
 };
-
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 
 function formatDate(date: string): string {
   const [year, month, day] = date.split("-");
   if (!year || !month || !day) return date;
   return `${Number(month)}/${Number(day)}/${year}`;
-}
-
-function formatShortDate(date: string): string {
-  const [, month, day] = date.split("-");
-  if (!month || !day) return date;
-  return `${MONTHS[Number(month) - 1] ?? month} ${Number(day)}`;
 }
 
 function statusText(status: DailyStatus, isDemo: boolean, puzzleTitle: string | null): string {
@@ -59,12 +57,6 @@ function statusText(status: DailyStatus, isDemo: boolean, puzzleTitle: string | 
   if (status === "unsolved") return "No route found";
   if (status === "failed") return "Capture needs review";
   return "Solve pending";
-}
-
-function statusIcon(status: DailyStatus): string {
-  if (status === "solved") return "✓";
-  if (status === "failed") return "!";
-  return "–";
 }
 
 const MOVE_NAMES: Record<string, string> = {
@@ -78,10 +70,14 @@ function SolutionSummary({
   solution,
   isDemo,
   isTodayPage,
+  isOptimizedPage = false,
+  optimalityProven = false,
 }: {
   solution: SolutionRecord;
   isDemo: boolean;
   isTodayPage: boolean;
+  isOptimizedPage?: boolean;
+  optimalityProven?: boolean;
 }) {
   const date = formatLongDate(solution.puzzle_date);
   const subject = isTodayPage
@@ -99,12 +95,17 @@ function SolutionSummary({
       .join(", ");
     return (
       <section className="solution-summary" aria-labelledby="solution-summary-title">
-        <h2 id="solution-summary-title">Solution summary</h2>
+        <h2 id="solution-summary-title">{isOptimizedPage ? "Optimized solution" : "Solution summary"}</h2>
         <p>
           {namedSubject} was solved in {solution.moves.length} moves. The replay
           above follows the recorded solution from the starting board to the
           completed line.
         </p>
+        {isOptimizedPage && (
+          <p>
+            {optimalityProven ? "Shortest path verified." : "Best verified path found so far; a shorter path may exist."} Every walk and push counts as one move.
+          </p>
+        )}
         <p className="solution-moves">
           <strong>Move sequence:</strong> <code>{moveSequence}</code>
           {directions && <span>{directions}</span>}
@@ -130,26 +131,72 @@ function SolutionSummary({
   );
 }
 
+function SolutionHintsSection({ solution }: { solution: SolutionRecord }) {
+  const explanation = buildSolutionExplanation(solution.board, solution.final_board, solution.step_boards);
+  if (solution.status !== "solved" || !solution.moves) return null;
+  return <SolutionHints goal={explanation.goal} phases={explanation.phases} />;
+}
+
 export function GameView({
   initialSolution,
   history,
   isDemo,
   isTodayPage,
+  loadSharedHistory = false,
+  optimized,
+  isOptimizedPage = false,
 }: Props) {
   const currentSolution = initialSolution;
-  const heading = isTodayPage
+  const titleSuffix = currentSolution.puzzle_title ? `: ${currentSolution.puzzle_title}` : "";
+  const heading = isOptimizedPage
+    ? `Tic Tac Go Optimized Solution: ${formatLongDate(currentSolution.puzzle_date)}${titleSuffix}`
+    : isTodayPage
     ? "Tic Tac Go Solution Today"
-    : `Tic Tac Go Solution - ${formatLongDate(currentSolution.puzzle_date)}`;
+    : `Tic Tac Go Solution: ${formatLongDate(currentSolution.puzzle_date)}${titleSuffix}`;
+  const jsonLd = {
+    "@context": "https://schema.org",
+    "@type": "WebPage",
+    name: `${heading}${currentSolution.puzzle_title ? `: ${currentSolution.puzzle_title}` : ""}`,
+    description: currentSolution.status === "solved" && currentSolution.moves
+      ? `Verified hint-first Tic Tac Go solution in ${currentSolution.moves.length} moves.`
+      : "Tic Tac Go puzzle status and verified replay.",
+    datePublished: currentSolution.puzzle_date,
+    breadcrumb: {
+      "@type": "BreadcrumbList",
+      itemListElement: [
+        { "@type": "ListItem", position: 1, name: "Tic Tac Go Solution", item: "/" },
+        { "@type": "ListItem", position: 2, name: currentSolution.puzzle_title ?? currentSolution.puzzle_date },
+      ],
+    },
+  };
 
   return (
     <>
+      <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(jsonLd).replace(/</g, "\\u003c") }} />
       <header className="game-header">
         <h1 className={isTodayPage ? undefined : "historical-heading"}>{heading}</h1>
-        <p>{isTodayPage ? "Daily Solver" : "Verified Replay"}</p>
+        <p>{isOptimizedPage ? "optimized-v1" : isTodayPage ? "Daily Solver" : "Verified Replay"}</p>
         <div className="date-pill">
           <time dateTime={currentSolution.puzzle_date}>{formatDate(currentSolution.puzzle_date)}</time>
           <span>{statusText(currentSolution.status, isDemo, currentSolution.puzzle_title)}</span>
         </div>
+        {optimized && (
+          <nav className="solution-version-nav" aria-label="Solution version">
+            <GardenLink
+              href={isTodayPage ? "/" : `/solutions/${currentSolution.puzzle_date}`}
+              aria-current={isOptimizedPage ? undefined : "page"}
+            >
+              Daily solution
+            </GardenLink>
+            <GardenLink
+              href={`/solutions/${currentSolution.puzzle_date}/optimized`}
+              aria-current={isOptimizedPage ? "page" : undefined}
+            >
+              <span>Optimized solution</span>
+              <span className="solution-version-count">{optimized.moveCount} moves</span>
+            </GardenLink>
+          </nav>
+        )}
       </header>
 
       <SolveDashboard
@@ -162,57 +209,25 @@ export function GameView({
         status={currentSolution.status}
         errorMessage={currentSolution.error_message}
         isDemo={isDemo}
+        hintFirst={!isTodayPage}
       />
 
       <SolutionSummary
         solution={currentSolution}
         isDemo={isDemo}
         isTodayPage={isTodayPage}
+        isOptimizedPage={isOptimizedPage}
+        optimalityProven={optimized?.optimalityProven}
       />
+      {!isTodayPage && <SolutionHintsSection solution={currentSolution} />}
 
-      {history.length > 0 && (
-        <nav className="history-carousel" aria-label="Past solutions">
-          <div className="history-header">
-            <p className="history-label">Past Solutions</p>
-            {!isTodayPage && (
-              <Link className="history-today-btn" href="/">
-                Today ↩
-              </Link>
-            )}
-          </div>
-          <div className="history-scroll">
-            {history.map((entry) => {
-              const isActive = entry.puzzle_date === currentSolution.puzzle_date;
-              return (
-                <Link
-                  key={entry.puzzle_date}
-                  href={`/solutions/${entry.puzzle_date}`}
-                  prefetch={false}
-                  className={[
-                    "history-tile",
-                    `history-tile-${entry.status}`,
-                    isActive ? "history-tile-active" : "",
-                  ]
-                    .filter(Boolean)
-                    .join(" ")}
-                  aria-current={isActive ? "page" : undefined}
-                  aria-label={`${entry.puzzle_title ?? formatShortDate(entry.puzzle_date)} — ${entry.status}`}
-                >
-                  <span className="history-tile-title">
-                    {entry.puzzle_title ?? "—"}
-                  </span>
-                  <span className="history-tile-date">
-                    {formatShortDate(entry.puzzle_date)}
-                  </span>
-                  <span className="history-tile-icon" aria-hidden="true">
-                    {statusIcon(entry.status)}
-                  </span>
-                </Link>
-              );
-            })}
-          </div>
-        </nav>
-      )}
+      <HistoryCarousel
+        initialHistory={history}
+        currentDate={currentSolution.puzzle_date}
+        isTodayPage={isTodayPage}
+        loadSharedHistory={loadSharedHistory}
+        optimized={isOptimizedPage}
+      />
     </>
   );
 }

@@ -13,6 +13,7 @@ from functools import lru_cache
 import logging
 import re
 from typing import Any
+from apps.api.puzzle_catalog import CatalogError, OFFICIAL_GAME_URL, load_catalog
 
 
 logger = logging.getLogger("tic_tac_go.daily_solve")
@@ -103,6 +104,28 @@ def is_generic_title(text: Any) -> bool:
     return _normalize_title_text(text) in _GENERIC_TITLES
 
 
+def normalize_official_title(text: Any) -> str | None:
+    """Normalize a title received from Google's catalog or our trusted manifest.
+
+    Official puzzle names are deliberately allowed to be short or punctuation
+    only (the historical ``-_-`` puzzle is real), unlike untrusted DOM text.
+    """
+    if not isinstance(text, str):
+        return None
+    normalized = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'")
+    if not normalized or len(normalized) > 80 or is_generic_title(normalized):
+        return None
+    return normalized
+
+
+def official_level_label(puzzle_date: date | datetime | str | None) -> str | None:
+    """Return Google's current official fallback label for a valid puzzle date."""
+    key = _date_key(puzzle_date)
+    if not key:
+        return None
+    return f"Level {key[:4]}-{key[4:6]}-{key[6:]}"
+
+
 def clean_puzzle_title(text: Any) -> str | None:
     """Return a usable puzzle title or None for generic/non-title text."""
     if not isinstance(text, str):
@@ -113,11 +136,15 @@ def clean_puzzle_title(text: Any) -> str | None:
         return None
     if _SLASH_DATE_RE.fullmatch(cleaned):
         return None
+    had_game_prefix = bool(_TITLE_PREFIX_RE.match(cleaned))
     cleaned = _TITLE_PREFIX_RE.sub("", cleaned).strip(" \t\r\n\"'-:|")
     cleaned = _GOOGLE_GAME_RE.sub(" ", cleaned)
     cleaned = _EMBEDDED_SLASH_DATE_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t\r\n\"'-:|")
-    cleaned = _CONTROL_SUFFIX_RE.sub("", cleaned).strip(" \t\r\n\"'-:|")
+    # The combined game widget text ends with controls. Do not strip normal
+    # titles such as "So Close" merely because they end in one control word.
+    if had_game_prefix:
+        cleaned = _CONTROL_SUFFIX_RE.sub("", cleaned).strip(" \t\r\n\"'-:|")
     cleaned = _TITLE_SUFFIX_RE.sub("", cleaned).strip(" \t\r\n\"'-:|")
     if not 3 <= len(cleaned) <= 60:
         return None
@@ -148,7 +175,7 @@ def _historical_titles() -> dict[str, str]:
         if not isinstance(entry, dict):
             continue
         key = _date_key(str(entry.get("id", "")))
-        title = _clean_title(entry.get("name"))
+        title = normalize_official_title(entry.get("name"))
         if key and title:
             titles[key] = title
     return titles
@@ -163,6 +190,24 @@ def title_from_past_days(puzzle_date: date | datetime | str | None) -> str | Non
     if title:
         logger.info("title_fetcher.backfill_found date=%s title=%r", key, title)
     return title
+
+
+def _official_catalog_titles() -> dict[str, str]:
+    """Share the validated, expiring board catalog instead of fetching twice."""
+    try:
+        snapshot = load_catalog()
+    except CatalogError as exc:
+        logger.info("title_fetcher.catalog_unavailable error=%s", exc)
+        return {}
+    return {entry.puzzle_date.strftime("%Y%m%d"): entry.title
+            for entry in snapshot.entries.values()}
+
+
+def title_from_official_catalog(puzzle_date: date | datetime | str | None) -> str | None:
+    key = _date_key(puzzle_date)
+    if not key:
+        return None
+    return _official_catalog_titles().get(key)
 
 
 def _title_from_css(page) -> str | None:
@@ -201,7 +246,7 @@ def _title_from_css(page) -> str | None:
 def _title_from_dom_walk(page) -> str | None:
     try:
         candidates = page.evaluate(
-            """
+            r"""
             () => {
                 const skipExact = new Set([
                     'a google game',
@@ -328,10 +373,22 @@ def extract_puzzle_title(page, puzzle_date: date | datetime | str | None = None)
     """
     title = _title_from_css(page) or _title_from_dom_walk(page) or _title_from_page_metadata(page)
     if title:
+        logger.info("title_fetcher.resolved source=live-dom title=%r", title)
         return title
 
-    fallback = title_from_past_days(puzzle_date)
+    catalog_title = title_from_official_catalog(puzzle_date)
+    if catalog_title:
+        logger.info("title_fetcher.resolved source=official-catalog title=%r", catalog_title)
+        return catalog_title
+
+    manifest_title = title_from_past_days(puzzle_date)
+    if manifest_title:
+        logger.info("title_fetcher.resolved source=historical-manifest title=%r", manifest_title)
+        return manifest_title
+
+    fallback = official_level_label(puzzle_date)
     if fallback:
+        logger.info("title_fetcher.resolved source=official-level-fallback title=%r", fallback)
         return fallback
 
     logger.info("title_fetcher.not_found date=%s", _date_key(puzzle_date))

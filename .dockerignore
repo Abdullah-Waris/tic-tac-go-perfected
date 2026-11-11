@@ -4,3 +4,13 @@ __pycache__
 *.pyc
 apps/web/node_modules
 .DS_Store
+.env
+.env.*
+apps/web/.next
+.vercel
+**/.env
+**/.env.*
+gha-creds-*.json
+solver/push_solver/*.so
+solver/push_solver/native-build.json
+build

@@ -6,17 +6,21 @@ Routes:
   GET  /debug/remote-browser    — dump remote-browser diagnostic info (cron-auth required)
   GET  /debug/screenshot        — capture and return the current puzzle screenshot (cron-auth required)
   POST /solve                   — solve an arbitrary board submitted in the request body
-  POST /jobs/daily-solve        — trigger the daily capture→parse→solve pipeline (cron-auth required)
+  POST /jobs/daily-solve        — resolve the dated board and solve (cron-auth required)
   GET  /solutions/today         — fetch today's stored solution
   GET  /solutions/recent        — list recent solution summaries
   GET  /solutions/{puzzle_date} — fetch the stored solution for a specific date
 """
 
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 import os
 import logging
+import re
 from datetime import date
+from pathlib import Path
 from typing import Literal
+from threading import Lock
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,15 +28,25 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from apps.api.board_capture import capture_google_board_screenshot, remote_browser_diagnostics
+from apps.api.puzzle_catalog import CatalogError, entry_for_date
 from apps.api.daily_solve import run_daily_solve, utc_puzzle_date
 from apps.api.solution_storage import (
     StorageError,
     close_pool,
+    cache_custom_solution,
+    get_cached_custom_solution,
     get_solution,
     list_recent_solutions,
+    list_daily_solve_runs,
+    reserve_custom_solve,
+    run_migrations,
 )
-from apps.api.puzzle_titles import clean_puzzle_title, title_from_past_days
-from solver.service import SolverError, solve_board
+from apps.api.puzzle_titles import (
+    normalize_official_title,
+    official_level_label,
+    title_from_past_days,
+)
+from solver.service import SolverError, solve_board, solve_custom_board
 
 
 logging.basicConfig(
@@ -76,6 +90,11 @@ class SolveResponse(BaseModel):
     start_board: list[list[Cell]]
     final_board: list[list[Cell]] | None
     steps: list[SolveStep]
+
+
+class CustomSolveResponse(SolveResponse):
+    cached: bool = False
+    remaining: int | None = None
 
 
 class SolutionRecord(BaseModel):
@@ -139,7 +158,7 @@ def pending_solution(puzzle_date: date) -> SolutionRecord:
     return SolutionRecord(
         puzzle_date=puzzle_date,
         source_url=os.getenv("GOOGLE_TIC_TAC_GO_URL", ""),
-        parser_name="gemini",
+        parser_name="not-run",
         solver_name="bfs",
         board=None,
         moves=None,
@@ -149,20 +168,23 @@ def pending_solution(puzzle_date: date) -> SolutionRecord:
         elapsed_ms=None,
         status="pending",
         error_message="No solution has been generated for this date yet.",
-        puzzle_title=title_from_past_days(puzzle_date),
+        puzzle_title=title_from_past_days(puzzle_date) or official_level_label(puzzle_date),
     )
 
 
 def with_title_fallback(record: dict) -> dict:
     """Clean a DB title and fall back to the historical manifest when unusable."""
-    title = clean_puzzle_title(record.get("puzzle_title"))
+    # Database/catalog titles are trusted official values and can legitimately
+    # be short or punctuation-only. Keep strict DOM cleaning for live capture.
+    title = normalize_official_title(record.get("puzzle_title"))
     if title:
         if title == record.get("puzzle_title"):
             return record
         return {**record, "puzzle_title": title}
     return {
         **record,
-        "puzzle_title": title_from_past_days(record.get("puzzle_date")),
+        "puzzle_title": title_from_past_days(record.get("puzzle_date"))
+        or official_level_label(record.get("puzzle_date")),
     }
 
 
@@ -175,6 +197,7 @@ def with_title_fallback(record: dict) -> dict:
 async def lifespan(_app: FastAPI):
     """Release process-local resources when a Cloud Run instance stops."""
     try:
+        run_migrations()
         yield
     finally:
         close_pool()
@@ -184,11 +207,151 @@ app = FastAPI(title="Tic Tac Go Solver API", lifespan=lifespan)
 logger = logging.getLogger("tic_tac_go.api")
 
 PUBLIC_CACHE_CONTROL = "public, max-age=60, s-maxage=300, stale-while-revalidate=300"
+_benchmark_lock = Lock()
+
+
+class PushBenchmarkRequest(BaseModel):
+    version: Literal["v3", "v4"] = "v4"
+    timeout_seconds: float = Field(default=30, gt=0, le=30)
+    max_nodes: int = Field(default=500_000, gt=0, le=500_000)
+    quality_timeout_seconds: float = Field(default=0, ge=0, le=30)
+    process: Literal["warm", "fresh"] = "warm"
+    route_limit: int = Field(default=3, ge=1, le=3)
+    schedule: Literal[
+        "rank", "uniform", "weighted", "beam", "beam8", "coverage",
+        "phs_beam", "phs_heavy", "phs_star_beam", "phs_star_heavy",
+        "phs_adaptive",
+    ] = "rank"
+    beam_mode: Literal["serial", "interleaved"] = "interleaved"
+    macro_mode: Literal["straight", "forced"] = "straight"
+    policy: Literal["phs-v1", "phs-mlp-v1"] | None = None
+    strategy: Literal["phs", "levin", "phs_star"] | None = None
+
+
+@app.post(
+    "/debug/push-benchmark/{puzzle_date}", dependencies=[Depends(require_cron_secret)]
+)
+def debug_push_benchmark(
+    puzzle_date: date, request: PushBenchmarkRequest, response: Response
+):
+    """Read-only search receipt: no fallback or write; V4 never uses exact hints."""
+    from solver.push_solver import solve_v3, solve_v4, verify_solution
+    from solver.push_solver.benchmark_v4 import ENGINE_SHA256, RUNNER_SHA256, provenance, row_for_entry, run_fresh
+    import json
+    import subprocess
+    import time
+
+    response.headers["Cache-Control"] = "no-store"
+    if not _benchmark_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail="Another benchmark is running in this process."
+        )
+    try:
+        needs_policy = request.version == "v4" and (
+            request.schedule.startswith("phs_") or request.strategy is not None
+        )
+        if needs_policy != (request.policy is not None):
+            raise HTTPException(
+                status_code=422,
+                detail="PHS experiments require an explicit named policy and a PHS schedule.",
+            )
+        if request.version == "v3" and (request.strategy is not None or request.schedule.startswith("phs_")):
+            raise HTTPException(status_code=422, detail="Policy experiments require V4.")
+        if request.version == "v3" and request.route_limit != 3:
+            raise HTTPException(status_code=422, detail="Route ablations require V4.")
+        try:
+            entry, _ = entry_for_date(puzzle_date)
+        except CatalogError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        kwargs = dict(
+            timeout_seconds=request.timeout_seconds,
+            max_nodes=request.max_nodes,
+            quality_timeout_seconds=request.quality_timeout_seconds,
+        )
+        if request.version == "v4":
+            kwargs["schedule"] = request.schedule
+            kwargs["route_limit"] = request.route_limit
+            kwargs["beam_mode"] = request.beam_mode
+            kwargs["macro_mode"] = request.macro_mode
+            if request.strategy is not None:
+                kwargs["strategy"] = request.strategy
+            if request.policy is not None:
+                filename = "policy.json" if request.policy == "phs-v1" else "policy-mlp.json"
+                kwargs["policy_path"] = (
+                    Path(__file__).resolve().parents[2]
+                    / "debug-artifacts/v4-phs-2026-10-26" / filename
+                )
+        if request.process == "fresh":
+            options = dict(
+                version=request.version, seconds=request.timeout_seconds, nodes=request.max_nodes,
+                quality_seconds=request.quality_timeout_seconds, schedule=request.schedule,
+                beam_mode=request.beam_mode, macro_mode=request.macro_mode,
+                strategy=request.strategy,
+                policy_path=str(kwargs["policy_path"]) if "policy_path" in kwargs else None,
+                routes=request.route_limit,
+            )
+            try:
+                receipt = run_fresh(row_for_entry(entry), **options)
+            except (subprocess.SubprocessError, json.JSONDecodeError, ValueError) as exc:
+                raise HTTPException(status_code=503, detail="Fresh benchmark worker failed") from exc
+            receipt["verified"] = bool(
+                receipt["result"]["solved"]
+                and verify_solution(entry.board(), receipt["result"]["moves"]).ok
+            )
+            return {**receipt, "puzzle_date": puzzle_date, "provenance": provenance(), "revision": os.getenv("K_REVISION")}
+        started = time.perf_counter()
+        result = (solve_v4 if request.version == "v4" else solve_v3)(entry.board(), **kwargs)
+        verified = bool(result.solved and verify_solution(entry.board(), result.moves).ok)
+        wall_seconds = time.perf_counter() - started
+        return {
+            **row_for_entry(entry),
+            "puzzle_date": puzzle_date,
+            "board_sha256": entry.board_sha256,
+            "version": request.version,
+            "verified": verified,
+            "engine_sha256": ENGINE_SHA256 if request.version == "v4" else None,
+            "runner_sha256": RUNNER_SHA256,
+            "process": "warm", "repeat": 0, "wall_seconds": wall_seconds,
+            "limits": {"seconds": request.timeout_seconds, "nodes": request.max_nodes},
+            "schedule": request.schedule, "routes": request.route_limit,
+            "beam_mode": request.beam_mode, "macro_mode": request.macro_mode,
+            "strategy_requested": request.strategy,
+            "quality_timeout_seconds": request.quality_timeout_seconds,
+            "result": asdict(result),
+            "provenance": provenance(),
+            "revision": os.getenv("K_REVISION"),
+        }
+    finally:
+        _benchmark_lock.release()
+
+
+@app.get("/debug/solver-config", dependencies=[Depends(require_cron_secret)])
+def debug_solver_config(response: Response):
+    import platform
+    import numpy as np
+    from solver.service import daily_push_version, daily_push_settings
+    from solver.push_solver.benchmark_v4 import ENGINE_SHA256, RUNNER_SHA256, provenance
+
+    response.headers["Cache-Control"] = "no-store"
+    version = daily_push_version()
+    return {
+        "daily": {"version": version, **daily_push_settings(version)},
+        "engine_sha256": ENGINE_SHA256, "runner_sha256": RUNNER_SHA256,
+        "provenance": provenance(), "architecture": platform.machine(), "numpy": np.__version__,
+        "revision": os.getenv("K_REVISION"), "deployment_id": os.getenv("VERCEL_DEPLOYMENT_ID"),
+    }
+
+
+@app.get("/debug/solve-runs/{puzzle_date}", dependencies=[Depends(require_cron_secret)])
+def debug_solve_runs(puzzle_date: date, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return {"puzzle_date": puzzle_date, "runs": list_daily_solve_runs(puzzle_date)}
 
 
 def enable_public_cache(response: Response) -> None:
     """Allow browsers and shared proxies to briefly cache public solution reads."""
     response.headers["Cache-Control"] = PUBLIC_CACHE_CONTROL
+
 
 allowed_origins = [
     origin.strip()
@@ -209,6 +372,7 @@ app.add_middleware(
 # Health
 # ---------------------------------------------------------------------------
 
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -217,6 +381,29 @@ def health() -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # Debug endpoints (cron-auth required)
 # ---------------------------------------------------------------------------
+
+
+@app.get("/debug/catalog/{puzzle_date}", dependencies=[Depends(require_cron_secret)])
+def debug_catalog(puzzle_date: date, response: Response) -> dict[str, object]:
+    """Inspect the authoritative input without solving, capturing, or storing."""
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        entry, snapshot = entry_for_date(puzzle_date)
+    except CatalogError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {
+        "puzzle_date": puzzle_date.isoformat(),
+        "puzzle_title": entry.title,
+        "parser_name": "catalog",
+        "width": entry.width,
+        "height": entry.height,
+        "board": entry.board(),
+        "board_sha256": entry.board_sha256,
+        "source_url": snapshot.source_url,
+        "source_sha256": snapshot.source_sha256,
+        "source_fetched_at": snapshot.fetched_at,
+    }
+
 
 @app.get(
     "/debug/remote-browser",
@@ -237,7 +424,9 @@ def debug_screenshot() -> FileResponse:
         result = capture_google_board_screenshot()
     except Exception as exc:
         logger.exception("debug_screenshot.failed")
-        raise HTTPException(status_code=500, detail=f"Screenshot capture failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Screenshot capture failed: {exc}"
+        ) from exc
 
     return FileResponse(
         result.screenshot_path,
@@ -251,9 +440,12 @@ def debug_screenshot() -> FileResponse:
 # Solver endpoint (not public)
 # ---------------------------------------------------------------------------
 
-@app.post("/solve", 
-          response_model=SolveResponse,
-          dependencies=[Depends(require_cron_secret)],)
+
+@app.post(
+    "/solve",
+    response_model=SolveResponse,
+    dependencies=[Depends(require_cron_secret)],
+)
 def solve(request: SolveRequest) -> SolveResponse:
     """Solve a board submitted directly in the request body."""
     try:
@@ -264,9 +456,59 @@ def solve(request: SolveRequest) -> SolveResponse:
     return SolveResponse(**result)
 
 
+@app.post(
+    "/solve/custom",
+    response_model=CustomSolveResponse,
+    dependencies=[Depends(require_cron_secret)],
+)
+def custom_solve(
+    request: SolveRequest,
+    x_custom_solver_client_hash: str | None = Header(default=None),
+) -> CustomSolveResponse:
+    """Run the bounded custom-board solver for the authenticated web proxy."""
+    client_hash = x_custom_solver_client_hash or ""
+    if not re.fullmatch(r"[a-f0-9]{64}", client_hash):
+        raise HTTPException(
+            status_code=400, detail="Missing or invalid custom solver client identity."
+        )
+
+    import hashlib
+    import json
+
+    # Stable JSON avoids cache fragmentation from equivalent request formatting.
+    board_hash = hashlib.sha256(
+        json.dumps(request.board, separators=(",", ":"), ensure_ascii=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+    try:
+        cached = get_cached_custom_solution(board_hash)
+        if cached is not None:
+            return CustomSolveResponse(**cached, cached=True, remaining=None)
+
+        count = reserve_custom_solve(client_hash)
+        if count is None:
+            raise HTTPException(
+                status_code=429,
+                detail="Daily custom solver limit reached. Try again after midnight UTC.",
+                headers={"Retry-After": "3600"},
+            )
+        result = solve_custom_board(request.board)
+        # The service verifies every successful route before returning it. Cache
+        # both solved and exhausted-search responses so repeats do not consume
+        # another public budget.
+        cache_custom_solution(board_hash, result)
+        return CustomSolveResponse(**result, cached=False, remaining=10 - count)
+    except StorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except SolverError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---------------------------------------------------------------------------
 # Cron job endpoint (cron-auth required)
 # ---------------------------------------------------------------------------
+
 
 @app.post(
     "/jobs/daily-solve",
@@ -274,14 +516,16 @@ def solve(request: SolveRequest) -> SolveResponse:
     dependencies=[Depends(require_cron_secret)],
 )
 def daily_solve_job() -> JobResponse:
-    """Trigger the daily capture → parse → solve pipeline for today's puzzle."""
+    """Resolve today's catalog board, with date-checked Gemini fallback, and solve."""
     try:
         record = run_daily_solve()
     except StorageError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("daily_solve_job.unhandled")
-        raise HTTPException(status_code=500, detail=f"Daily solve failed: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"Daily solve failed: {exc}"
+        ) from exc
 
     return JobResponse(**record)
 
@@ -289,6 +533,7 @@ def daily_solve_job() -> JobResponse:
 # ---------------------------------------------------------------------------
 # Solution read endpoints (public)
 # ---------------------------------------------------------------------------
+
 
 @app.get("/solutions/today", response_model=SolutionRecord)
 def today_solution(response: Response) -> SolutionRecord:

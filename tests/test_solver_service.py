@@ -9,6 +9,61 @@ from solver.service import SolverError, _solver_impl, solve_board, solve_daily_b
 
 
 class SolverServiceTest(unittest.TestCase):
+    def test_v4_selector_changes_daily_only_and_reports_separate_counts(self):
+        from solver.push_solver import solve_v4
+        from solver.service import solve_custom_board
+
+        result = solve_v4([["U", "O", "O"]], quality_timeout_seconds=0)
+        with (
+            patch.dict("os.environ", {"DAILY_PUSH_SOLVER_VERSION": "v4"}),
+            patch("solver.push_solver.solve_v4", return_value=result) as v4,
+            patch("solver.service._run_push_solver", return_value=result) as v3,
+            patch("solver.service._run_heuristic_cnn_solver") as fallback,
+        ):
+            daily = solve_daily_board([["U", "O", "O"]])
+            self.assertEqual(daily["solver_name"], "push-v4")
+            self.assertEqual(daily["diagnostics"]["fallback_reported_transitions"], 0)
+            v4.assert_called_once()
+            self.assertEqual(v4.call_args.kwargs["schedule"], "coverage")
+            self.assertEqual(v4.call_args.kwargs["route_limit"], 2)
+            self.assertEqual(v4.call_args.kwargs["quality_timeout_seconds"], 30)
+            custom = solve_custom_board([["U", "O", "O"], ["", "", ""], ["", "", ""]])
+            self.assertEqual(custom["solver_name"], "push-v3-custom")
+            v3.assert_called_once()
+            v4.assert_called_once()
+            fallback.assert_not_called()
+
+    def test_fallback_error_keeps_push_diagnostics(self):
+        result = SimpleNamespace(moves=None, final_board=None, nodes_expanded=7)
+        with (
+            patch("solver.service._run_push_solver", return_value=result),
+            patch(
+                "solver.service._run_heuristic_cnn_solver",
+                side_effect=RuntimeError("fallback interrupted"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "fallback interrupted") as error:
+                solve_daily_board([["U", "O", "O"]])
+        self.assertEqual(error.exception.diagnostics["push_expanded_nodes"], 7)
+        self.assertIn("fallback_wall_ms", error.exception.diagnostics)
+
+    def test_push_receipt_is_committed_before_long_fallback_starts(self):
+        result = SimpleNamespace(moves=None, final_board=None, nodes_expanded=13)
+        phases = []
+
+        def persist(diagnostics):
+            phases.append(("persisted", diagnostics["push_expanded_nodes"]))
+
+        def fallback(board):
+            self.assertEqual(phases, [("persisted", 13)])
+            return None, None, 7
+
+        with (
+            patch("solver.service._run_push_solver", return_value=result),
+            patch("solver.service._run_heuristic_cnn_solver", side_effect=fallback),
+        ):
+            solve_daily_board([["U", "O", "O"]], on_push_complete=persist)
+
     def test_solved_board_returns_structured_result(self):
         result = solve_board(
             [

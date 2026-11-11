@@ -1,6 +1,8 @@
 # Tic Tac Go Perfected
 
-Solver for Tic-Tac-Go, a push-puzzle game where an agent maneuvers pieces into a 3-in-a-row configuration with a web frontend and FastAPI backend. Uses BFS/A* for smaller boards and beam search combined with a behavioral cloning CNN trained on 15,000+ board/move pairs for complex 8x8 configurations, selecting the appropriate algorithm based on board size and complexity. Achieves 93% solve rate across 334 real game boards.
+Solver for Tic-Tac-Go, a push-puzzle game where an agent maneuvers pieces into a 3-in-a-row configuration, with a Next.js frontend and FastAPI backend. The production daily pipeline runs Push Solver V4 first, then heuristic/CNN beam search when needed, and independently verifies returned paths.
+
+The September 8, 2026 production audit found **348 daily boards marked solved out of 351 stored (99.15%)**. The 51 successful records attributed to push-v3 all had recorded times below 30 seconds, with a **5.08-second median**. These are historical stored outcomes, not an attempt-level benchmark or proof that captures matched the official boards; 211 other solved records have no timing measurements. An October 22 comparison subsequently found ten stored solutions that fail against Google's current official layouts. See the [metrics and indexing audit](docs/audits/project-metrics-and-indexing-2026-09-08.md) for definitions, limitations, and evidence.
 
 ## Project Layout
 
@@ -10,6 +12,54 @@ Solver for Tic-Tac-Go, a push-puzzle game where an agent maneuvers pieces into a
   training experiments.
 - `tictacgo_solver_v3.md`: Push Solver V3 diagnosis, architecture, coverage
   invariant, and measured release results.
+- [Catalog ingestion and V4 evidence](docs/audits/catalog-ingestion-and-v4-data-2026-10-22.md):
+  input contract, archive mismatches, verified recovery paths, and reproducible benchmarks.
+
+## Production push solver V4
+
+**optimized-v1** publishes a separate verified best-path bank and indexable
+`/solutions/YYYY-MM-DD/optimized` pages. Its local updater performs all search
+and backfill work, then publishes a static feed on `optimized-v1-data`; it uses
+neither the database nor hosted solver compute. Browse `/optimized-solutions`
+for the archive. See [the algorithm and local updater guide](docs/optimized-path-solver.md).
+
+Production selects `DAILY_PUSH_SOLVER_VERSION=v4`. Daily jobs also accept `v3`
+for rollback; the source fallback remains `v3` when the variable is absent.
+Custom/direct routing is unchanged. The push budget remains
+30 seconds / 500,000 nodes, followed by the existing Beam/CNN fallback.
+
+Implementation, reproducible corpus benchmarks, and the release gates are in
+[the V4 evidence report](docs/audits/push-solver-v4-2026-10-25.md). Authenticated
+`POST /debug/push-benchmark/{date}` runs a read-only push benchmark, and
+`GET /debug/solve-runs/{date}` reads retry diagnostics. Neither endpoint repairs
+archive records or changes the daily selector.
+
+The November 9 candidate's explicit `schedule="coverage"` combines six global,
+focused, and wider beam streams. With two routes and a 30-second quality window,
+its compiled one-CPU / 4 GiB Linux run solves **397/397** at **38.29 mean moves**,
+median 31, with a 7.93-second maximum and no lost V3 solutions. All 180 mandatory
+local repetitions and 30 extra guard trials pass. Matching actual Cloud Run
+qualification also passes **397/397**, **180/180 repetitions**, and **30/30 guard
+trials**, at **40.47 mean moves** and a 24.30-second corpus maximum. The live
+daily selector uses that qualified immutable image, and all fourteen post-rollout
+smoke boards pass. November 7–8 are publicly verified with 44 and 71 moves.
+
+An earlier controlled development comparison with matching 10-second quality
+windows used 18.10% fewer moves than V3 on their 383 shared verified boards.
+That paired comparison is separate from the latest full-corpus mean. See
+[the production qualification report](docs/audits/push-solver-v4-production-2026-11-09.md),
+[the quality report](docs/audits/push-solver-v4-quality-2026-11-09.md) and
+[the preceding coverage work](docs/audits/push-solver-v4-regressions-2026-11-09.md).
+
+## Offline optimized paths (experimental)
+
+The standalone optimizer consumes verified archived paths and minimizes total
+walking plus pushing moves. `graph` combines observed trajectories, `repair`
+searches nearby layouts, and `exact` runs incumbent-bounded A* with a relaxed
+two-O pattern database. Only the exact search can certify nontrivial global
+optimality. This experiment does not change production V4 or publish solutions.
+
+See [the approach and reproducible commands](docs/optimized-path-solver.md).
 
 ## Local Development
 
@@ -45,14 +95,21 @@ The API exposes:
 If the frontend is not running on `http://localhost:3000`, set
 `API_ALLOWED_ORIGINS` for the backend.
 
-The daily job also needs `DATABASE_URL`, `GEMINI_API_KEY`, `CRON_SECRET`, and
-`GOOGLE_TIC_TAC_GO_URL`.
+The daily job reads the requested date directly from Google's published catalog.
+It needs `DATABASE_URL` and `CRON_SECRET`. `GEMINI_API_KEY` and a configured browser
+are required only for screenshot fallback when the catalog cannot be used;
+`GEMINI_MODEL` selects that fallback model. `GOOGLE_TIC_TAC_GO_URL` configures the
+fallback capture URL. Captures with a wrong or unknown date are rejected. OpenCV
+experiments are archived under `solver/boardParsers/archive/opencv/`.
 
-The daily cron job runs Push Solver V3 first. V3 gives the coverage-preserving
-V2 portfolio the complete 500,000-node/30-second budget, then uses time left in
-the first 10 seconds to improve any verified incumbent by total keystrokes. If
-push search does not solve the board, it falls back to the heuristic beam solver
-and then CNN-guided beam search. Every returned path is independently verified.
+Catalog records preserve Google's board coordinates and store the versioned bundle
+URL as provenance. A failed daily retry cannot replace a solved row.
+
+The production daily cron selects Push Solver V4 with `coverage`, two routes,
+and a quality window within the complete 500,000-node/30-second budget. V3 remains
+available through the selector and retains its original 10-second quality window.
+If push search does not solve the board, the existing heuristic beam and
+CNN-guided fallback follows. Every returned path is independently verified.
 
 The direct `POST /solve` API remains configurable. Boards that are at least
 `6x6` route to the heuristic-CNN beam solver. Smaller boards use the legacy
@@ -185,8 +242,12 @@ Set these environment variables on the Vercel project:
 
 - `API_ALLOWED_ORIGINS`: `https://tictacgo.shauryav.com`
 - `CRON_SECRET`
+- `CUSTOM_SOLVER_RATE_LIMIT_SECRET`: a distinct high-entropy secret used only
+  to HMAC client identities for the public custom-board solver. Never use a
+  raw IP address as a database key.
 - `DATABASE_URL`
-- `GEMINI_API_KEY`
+- `GEMINI_API_KEY`: screenshot fallback only
+- `GEMINI_MODEL`: optional screenshot fallback model
 - `GOOGLE_TIC_TAC_GO_URL`
 - `SOLVER_IMPL`: optional direct `POST /solve` selection; the daily cron uses
   push with Beam/CNN fallback regardless of this setting
@@ -236,3 +297,18 @@ only for local development.
 
 If you set `API_BASE_URL` in production, use
 `https://tictacgo.shauryav.com/api/python`.
+
+### Publishing a title-only repair
+
+Use the auditable title backfill rather than the board backfill for missing
+labels. It updates only blank titles and never changes a stored board, route,
+or solution status. After deployment, call the publication endpoint so cached
+solution pages and the dynamic sitemap refresh together:
+
+```bash
+.venv/bin/python backfill_puzzle_titles.py \
+  --audit-only
+
+.venv/bin/python backfill_puzzle_titles.py \
+  --publish-url https://tictacgo.shauryav.com/api/maintenance/publish-solution-cache
+```

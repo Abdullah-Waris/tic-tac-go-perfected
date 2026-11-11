@@ -1,15 +1,24 @@
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { GameView } from "../../game-view";
+import { getOptimizedSolutions, matchesOptimizedBoard } from "../../optimized-solution-data";
 import {
   formatLongDate,
-  getFullHistory,
   getSolutionByDate,
+  getNearbyHistory,
   isIsoDate,
   solutionMetaDescription,
 } from "../../solution-data";
 
-export const dynamic = "force-dynamic";
+export const dynamic = "force-static";
+export const dynamicParams = true;
+export const revalidate = 300;
+
+export function generateStaticParams() {
+  // Generate on first request. Hourly revalidation provides a recovery path
+  // even when an authenticated cache-publication request was missed.
+  return [];
+}
 
 type Props = {
   params: Promise<{ date: string }>;
@@ -37,10 +46,12 @@ export async function generateMetadata({ params }: Props): Promise<Metadata> {
 
 export default async function HistoricalSolutionPage({ params }: Props) {
   const { date } = await params;
-  const [solution, history] = await Promise.all([
-    loadSolution(date),
-    getFullHistory(),
-  ]);
+  const solution = await loadSolution(date);
+
+  // These links must exist before JavaScript runs, including for older boards
+  // outside the recent-history window. The carousel can still refresh on mount.
+  const [history, optimizedSolutions] = await Promise.all([getNearbyHistory(date), getOptimizedSolutions()]);
+  const optimized = optimizedSolutions.find((row) => row.puzzle_date === date) ?? null;
 
   return (
     <main className="page">
@@ -50,6 +61,8 @@ export default async function HistoricalSolutionPage({ params }: Props) {
           history={history}
           isDemo={false}
           isTodayPage={false}
+          loadSharedHistory
+          optimized={matchesOptimizedBoard(solution, optimized) && optimized ? { moveCount: optimized.moves.length, optimalityProven: optimized.optimality_proven } : undefined}
         />
 
         <footer className="site-footer">
